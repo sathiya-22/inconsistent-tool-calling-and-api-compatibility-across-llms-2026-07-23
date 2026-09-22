@@ -1,5 +1,5 @@
 import inspect
-from typing import Callable, Any, Dict, Type, List, Optional, Union
+from typing import Callable, Any, Dict, Type, List, Optional, Union, get_origin, get_args
 from pydantic import BaseModel, Field, create_model
 
 class Tool:
@@ -49,23 +49,20 @@ class ToolSchemaAdapter:
         required_params = []
 
         for field_name, field in tool.schema.model_fields.items():
+            json_schema_type = self._pydantic_type_to_json_schema_type(field.annotation)
             field_info = {
-                "type": self._pydantic_type_to_json_schema_type(field.annotation),
+                "type": json_schema_type,
                 "description": field.description or ""
             }
+            if json_schema_type == "array":
+                # For arrays, we need to specify the items type
+                inner_type = get_args(field.annotation)[0] if get_args(field.annotation) else Any
+                field_info["items"] = {"type": self._pydantic_type_to_json_schema_type(inner_type)}
+
             if field.is_required():
                 required_params.append(field_name)
-            if field.default is not None and not field.is_required():
-                # Gemini doesn't explicitly support 'default' in FunctionDeclaration,
-                # but we can include it in description or omit if not strictly needed.
-                # For this prototype, we'll just ensure the type is correct.
-                pass # Default values are handled by Pydantic validation, not LLM schema.
-
+            
             properties[field_name] = field_info
-
-        # Handle enums if necessary (Pydantic Enum -> JSON schema enum)
-        # Handle nested models if necessary (Pydantic Model -> JSON schema object)
-        # This prototype keeps it simple for direct types.
 
         return {
             "name": tool.name,
@@ -78,18 +75,27 @@ class ToolSchemaAdapter:
         }
 
     def _pydantic_type_to_json_schema_type(self, pydantic_type: Any) -> str:
-        """Maps Pydantic types to JSON schema types."""
-        if pydantic_type in (str, Optional[str]):
+        """Maps Pydantic types to JSON schema types, handling Optional and generic types."""
+        # Handle Optional types by unwrapping them
+        if get_origin(pydantic_type) is Union and type(None) in get_args(pydantic_type):
+            # It's an Optional type, get the actual type
+            actual_type = [arg for arg in get_args(pydantic_type) if arg is not type(None)][0]
+            return self._pydantic_type_to_json_schema_type(actual_type)
+
+        if pydantic_type in (str,):
             return "string"
-        elif pydantic_type in (int, Optional[int]):
+        elif pydantic_type in (int,):
             return "integer"
-        elif pydantic_type in (float, Optional[float]):
+        elif pydantic_type in (float,):
             return "number"
-        elif pydantic_type in (bool, Optional[bool]):
+        elif pydantic_type in (bool,):
             return "boolean"
-        elif pydantic_type in (list, List[Any], Optional[List[Any]]):
+        elif get_origin(pydantic_type) is list or pydantic_type is list:
             return "array"
-        elif pydantic_type in (dict, Dict[Any, Any], Optional[Dict[Any, Any]]):
+        elif get_origin(pydantic_type) is dict or pydantic_type is dict:
             return "object"
-        # Handle more complex types or Pydantic models recursively if needed
+        # If it's a Pydantic BaseModel, treat it as an object
+        elif inspect.isclass(pydantic_type) and issubclass(pydantic_type, BaseModel):
+            return "object"
+        
         return "string" # Default to string for unknown or complex types for simplicity
